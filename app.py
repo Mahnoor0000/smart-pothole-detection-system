@@ -1,126 +1,229 @@
 import streamlit as st
 import cv2
 import numpy as np
-import supervision as sv
-from ultralytics import YOLO
-import time
+import pandas as pd
+import tempfile
 from PIL import Image
+from ultralytics import YOLO
 
-st.set_page_config(layout="wide")
+# Page Settings
 
-# Initialize the YOLO model and tracker
-model = YOLO("runs/segment/train/weights/best_ncnn_model")
-tracker = sv.ByteTrack()
-mask_annotator = sv.MaskAnnotator()
+st.set_page_config(
+    page_title="Smart Pothole Detection System",
+    layout="wide"
+)
 
-def callback(frame: np.ndarray, confidence: float) -> np.ndarray:
-    # Perform detection and tracking on a single frame
-    results = model(frame, conf=confidence)[0]
-    detections = sv.Detections.from_ultralytics(results)
-    detections = tracker.update_with_detections(detections)
-    
-    # Annotate the frame with bounding boxes and traces
-    return mask_annotator.annotate(frame.copy(), detections=detections)
+st.title("Smart Pothole Detection System")
+st.write("Detect potholes in road images and videos using YOLO segmentation.")
 
-def video_input(data_src, confidence):
-    vid_file = None
-    if data_src == 'Sample data':
-        vid_file = "sample/vid.mp4"
+# -----------------------------
+# Load YOLO Model
+# -----------------------------
+@st.cache_resource
+def load_model():
+    model = YOLO("best.pt")
+    return model
+
+model = load_model()
+
+
+# Helper Function: Severity
+
+
+def get_severity(pothole_count):
+    if pothole_count == 0:
+        return "No Pothole"
+    elif pothole_count <= 2:
+        return "Low"
+    elif pothole_count <= 5:
+        return "Medium"
     else:
-        vid_bytes = st.sidebar.file_uploader("Upload a video", type=['mp4', 'mov', 'avi', 'mkv', 'webm'])
-        if vid_bytes:
-            vid_file = "uploaded_video." + vid_bytes.name.split('.')[-1]
-            with open(vid_file, 'wb') as out:
-                out.write(vid_bytes.read())
+        return "High"
 
-    if vid_file:
-        cap = cv2.VideoCapture(vid_file)
-        custom_size = st.sidebar.checkbox("Custom frame size")
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        if custom_size:
-            width = st.sidebar.number_input("Width", min_value=120, step=20, value=width)
-            height = st.sidebar.number_input("Height", min_value=120, step=20, value=height)
+# Detection Function
 
-        # Display video metadata like frame size and FPS
-        fps = 0
-        st1, st2, st3 = st.columns(3)
-        
-        with st1:
-            st.markdown("## Height")
-            st1_text = st.markdown(f"{height}")
-        with st2:
-            st.markdown("## Width")
-            st2_text = st.markdown(f"{width}")
-        with st3:
-            st.markdown("## FPS")
-            st3_text = st.markdown(f"{fps}")
+def detect_potholes(image, confidence):
+    results = model(image, conf=confidence)[0]
+
+    pothole_count = 0
+    confidences = []
+
+    if results.boxes is not None:
+        pothole_count = len(results.boxes)
+
+        for box in results.boxes:
+            conf = float(box.conf[0])
+            confidences.append(conf)
+
+    avg_confidence = 0
+    if len(confidences) > 0:
+        avg_confidence = sum(confidences) / len(confidences)
+
+    severity = get_severity(pothole_count)
+
+    annotated_image = results.plot()
+
+    return annotated_image, pothole_count, avg_confidence, severity
+
+
+
+# Sidebar
+
+st.sidebar.title("Settings")
+
+input_type = st.sidebar.radio(
+    "Choose input type",
+    ["Image", "Video"]
+)
+
+confidence = st.sidebar.slider(
+    "Confidence Threshold",
+    min_value=0.1,
+    max_value=1.0,
+    value=0.3,
+    step=0.05
+)
+
+# Image Input
+
+if input_type == "Image":
+    uploaded_image = st.sidebar.file_uploader(
+        "Upload road image",
+        type=["jpg", "jpeg", "png"]
+    )
+
+    if uploaded_image is not None:
+        image = Image.open(uploaded_image).convert("RGB")
+        image_np = np.array(image)
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("Original Image")
+            st.image(image_np, use_column_width=True)
+
+        with col2:
+            st.subheader("Detection Result")
+
+            result_image, count, avg_conf, severity = detect_potholes(
+                image_np,
+                confidence
+            )
+
+            st.image(result_image, use_column_width=True)
 
         st.markdown("---")
-        output = st.empty() # Placeholder for the processed frame
-        prev_time = 0
-        curr_time = 0
-        
-        while True:
+        st.subheader("Detection Summary")
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric("Potholes Detected", count)
+        c2.metric("Average Confidence", f"{avg_conf * 100:.2f}%")
+        c3.metric("Road Severity", severity)
+
+        report = pd.DataFrame({
+            "Potholes Detected": [count],
+            "Average Confidence": [round(avg_conf * 100, 2)],
+            "Severity": [severity]
+        })
+
+        csv = report.to_csv(index=False)
+
+        st.download_button(
+            label="Download Report as CSV",
+            data=csv,
+            file_name="pothole_detection_report.csv",
+            mime="text/csv"
+        )
+
+    else:
+        st.info("Upload an image from the sidebar to start detection.")
+
+
+# Video Input
+
+else:
+    uploaded_video = st.sidebar.file_uploader(
+        "Upload road video",
+        type=["mp4", "avi", "mov", "mkv"]
+    )
+
+    if uploaded_video is not None:
+        temp_file = tempfile.NamedTemporaryFile(delete=False)
+        temp_file.write(uploaded_video.read())
+
+        cap = cv2.VideoCapture(temp_file.name)
+
+        st.subheader("Video Detection Result")
+        frame_placeholder = st.empty()
+
+        frame_number = 0
+        total_potholes = 0
+        report_data = []
+
+        while cap.isOpened():
             ret, frame = cap.read()
-            
+
             if not ret:
-                st.write("Can't read frame, stream ended? Exiting ....")
                 break
-            
-            frame = cv2.resize(frame, (width, height))
+
+            frame_number += 1
+
+            # Process every 5th frame to keep app simple and faster
+            if frame_number % 5 != 0:
+                continue
+
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            processed_frame = callback(frame, confidence)
-            output.image(processed_frame, caption="Pothole Detection Result", use_column_width=True)
-            curr_time = time.time()
-            fps = 1 / (curr_time - prev_time)
-            prev_time = curr_time
-            
-            # Update video metadata during playback
-            st1_text.markdown(f"**{height}**")
-            st2_text.markdown(f"**{width}**")
-            st3_text.markdown(f"**{fps:.2f}**")
+
+            result_frame, count, avg_conf, severity = detect_potholes(
+                frame,
+                confidence
+            )
+
+            total_potholes += count
+
+            report_data.append({
+                "Frame Number": frame_number,
+                "Potholes Detected": count,
+                "Average Confidence": round(avg_conf * 100, 2),
+                "Severity": severity
+            })
+
+            frame_placeholder.image(
+                result_frame,
+                channels="RGB",
+                use_column_width=True
+            )
 
         cap.release()
 
-def image_input(data_src, confidence):
-    img_file = None
-    
-    if data_src == 'Sample data':
-        img_file = "sample/img.jpg"
+        st.markdown("---")
+        st.subheader("Video Detection Summary")
+
+        if len(report_data) > 0:
+            report_df = pd.DataFrame(report_data)
+
+            max_potholes = report_df["Potholes Detected"].max()
+            avg_confidence = report_df["Average Confidence"].mean()
+            final_severity = get_severity(max_potholes)
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric("Max Potholes in a Frame", int(max_potholes))
+            c2.metric("Average Confidence", f"{avg_confidence:.2f}%")
+            c3.metric("Overall Severity", final_severity)
+
+            st.subheader("Frame-wise Report")
+            st.dataframe(report_df)
+
+            csv = report_df.to_csv(index=False)
+
+            st.download_button(
+                label="Download Video Report as CSV",
+                data=csv,
+                file_name="video_pothole_detection_report.csv",
+                mime="text/csv"
+            )
+
     else:
-        img_bytes = st.sidebar.file_uploader("Upload an image", type=['png', 'jpeg', 'jpg'])
-        if img_bytes:
-            img_file = "uploaded_image." + img_bytes.name.split('.')[-1]
-            Image.open(img_bytes).save(img_file)
-
-    if img_file:
-        image = cv2.imread(img_file)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # Display original and processed images side by side
-        col1, col2 = st.columns(2)
-        with col1:
-            st.image(image, caption="Original Image")
-        with col2:
-            processed_image = callback(image, confidence)
-            st.image(processed_image, caption="Pothole Detection Result")
-
-def main():
-    st.title("Pothole Detection")
-    st.sidebar.title("Settings")
-
-    input_type = st.sidebar.radio("Select input type:", ['Image', 'Video'])
-    input_source = st.sidebar.radio("Select input source:", ['Sample data', 'Upload your own data'])
-    confidence = st.sidebar.slider('Confidence Threshold', min_value=0.1, max_value=1.0, value=0.3)
-
-    # Call respective input handling functions based on user choice
-    if input_type == 'Video':
-        video_input(input_source, confidence)
-    else:
-        image_input(input_source, confidence)
-
-if __name__ == "__main__":
-    main()
+        st.info("Upload a video from the sidebar to start detection.")

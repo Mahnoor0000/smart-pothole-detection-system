@@ -4,7 +4,7 @@ import supervision as sv
 from ultralytics import YOLO
 
 # Initialize the YOLO model and tracker
-model = YOLO("runs/segment/train/weights/best_ncnn_model")
+model = YOLO("best.pt")
 tracker = sv.ByteTrack()
 mask_annotator = sv.MaskAnnotator(color=sv.Color.RED)
 
@@ -31,7 +31,7 @@ def display_video(source_path: str):
 
         processed_frame = callback(frame)
 
-        cv2.imshow("Person Detection and Tracking", processed_frame)
+        cv2.imshow("Pothole Detection", processed_frame)
 
         # Break the loop if the user presses 'q'
         if cv2.waitKey(30) & 0xFF == ord('q'):
